@@ -1,7 +1,7 @@
 import { createServer } from "node:http";
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
-import { existsSync, statSync } from "node:fs";
-import { extname, isAbsolute, join, normalize, resolve } from "node:path";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { extname, join, normalize } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 import { execFile, spawn } from "node:child_process";
@@ -13,6 +13,7 @@ const id = "opencode-history-browser";
 const root = dirname(fileURLToPath(import.meta.url));
 const publicDir = join(root, "public");
 const execFileAsync = promisify(execFile);
+const browserMode = process.env.OPENCODE_BROWSER_MODE === "1";
 const cliMode = process.env.OPENCODE_HISTORY_CLI === "1";
 let server;
 let serverUrl;
@@ -21,6 +22,7 @@ let serverIdleTimer;
 let lastBrowserSeen = 0;
 let shutdownHandlersRegistered = false;
 const serverSockets = new Set();
+const serverIdleMs = 2 * 60 * 1000;
 
 async function tui(api) {
   if (!cliMode) {
@@ -158,9 +160,6 @@ async function listenOnAvailablePort(httpServer, firstPort) {
 
 async function handleRequest(api, request, response) {
   const url = new URL(request.url || "/", "http://127.0.0.1");
-  if (request.method === "GET" && url.pathname === "/api/health") {
-    return sendJson(response, { ok: true, url: serverUrl });
-  }
   if (url.pathname.startsWith("/api/") && !isAuthorized(request, url)) {
     return sendJson(response, { error: "Unauthorized history browser request" }, 401);
   }
@@ -231,30 +230,8 @@ async function handleRequest(api, request, response) {
       if (result.error || !result.data) return sendJson(response, { error: "Session not found" }, 404);
       directory = result.data.directory || directory;
     }
-    await openOpenCodeTerminal({
-      directory,
-      sessionID,
-      serverUrl: api.opencodeUrl,
-      preferredCommand: api.opencodeCommand,
-    });
+    await openOpenCodeTerminal({ directory, sessionID, serverUrl: api.opencodeUrl });
     return sendJson(response, { ok: true, sessionID, directory });
-  }
-
-  if (request.method === "POST" && url.pathname === "/api/local-path") {
-    const body = await readJson(request);
-    const target = normalizeLocalPath(body.path);
-    const action = String(body.action || "info");
-    if (!target || !isAbsolute(target)) return sendJson(response, { error: "A valid absolute local path is required." }, 400);
-    const info = await localPathInfo(target, true);
-    if (!info.exists) return sendJson(response, { error: "The local path no longer exists.", path: target }, 404);
-    if (action === "open") await openLocalPath(target, info.type);
-    else if (action === "locate") {
-      if (info.type === "file") await revealLocalFile(target);
-      else await openLocalPath(target, info.type);
-    } else if (action !== "info") {
-      return sendJson(response, { error: "Unknown local path action." }, 400);
-    }
-    return sendJson(response, { ok: true, path: target, type: info.type });
   }
 
   if (request.method === "POST" && url.pathname.startsWith("/api/permissions/")) {
@@ -373,9 +350,7 @@ async function listSessions(api, search) {
   const result = await assertOk(client.list({ limit: 250, search: search || undefined, archived: false }));
   const pinned = getPinned(api);
   const pinnedRank = new Map(pinned.map((sessionID, index) => [sessionID, index]));
-  let source = Array.isArray(result)
-    ? result.filter((session) => !(session.parentID || session.parent_id))
-    : [];
+  let source = Array.isArray(result) ? result : [];
   if (!source.length) source = await listSessionsFromCli(search);
   const rows = await Promise.all(source.map((session) => sessionRow(api, session, pinned)));
   rows.sort((a, b) => {
@@ -435,7 +410,6 @@ async function sessionRow(api, session, pinned) {
     updated: session.time?.updated || 0,
     archived: session.time?.archived,
     projectID: session.projectID || session.project_id || "",
-    parentID: session.parentID || session.parent_id || "",
     model: normalizeModel(session.model),
     agent: session.agent || "",
     cost: session.cost || 0,
@@ -458,45 +432,33 @@ async function getSession(api, sessionID) {
   } catch {}
   const pinned = getPinned(api);
   const output = await sessionRow(api, sessionResult.data, pinned);
-  const workspace = sessionResult.data.directory || process.cwd();
   output.todos = todos;
-  output.messages = await Promise.all((Array.isArray(messagesResult) ? messagesResult : []).map(async (item) => {
+  output.messages = (Array.isArray(messagesResult) ? messagesResult : []).map((item) => {
     const partText = (item.parts || [])
       .filter((part) => part.type === "text" && part.text)
       .map((part) => part.text)
       .join("\n\n")
       .trim();
     const error = messageError(item.info?.error);
-    const aborted = /(?:MessageAbortedError|AbortError|\bAborted\b)/i.test(error);
-    const text = partText || (aborted ? "" : error);
-    const activities = (item.parts || [])
-      .filter((part) => part.type && part.type !== "text")
-      .map((part) => {
-        const activity = activityRow(part, workspace);
-        return {
-          ...activity,
-          paths: activity.paths || resolveLocalPaths(activity.detail, workspace),
-        };
-      });
+    const text = partText || error;
+    const activities = (item.parts || []).filter((part) => part.type && part.type !== "text").map(activityRow);
     const extras = activities.map((activity) => activity.label).slice(0, 8);
-    if (error && partText && !aborted) extras.push(error);
+    if (error && partText) extras.push(error);
     return {
       id: item.info?.id || "",
       role: item.info?.role || "message",
       created: item.info?.time?.created || 0,
       completed: item.info?.time?.completed || 0,
-      error: aborted ? "" : (error || ""),
-      aborted,
+      error: error || "",
       text,
-      paths: resolveLocalPaths(partText, workspace),
       extras,
       activities,
     };
-  }));
+  });
   return output;
 }
 
-function activityRow(part, workspace) {
+function activityRow(part) {
   if (part.type === "reasoning") {
     return {
       type: part.type,
@@ -509,16 +471,11 @@ function activityRow(part, workspace) {
     const state = part.state || {};
     const input = formatActivityValue(state.input);
     const output = state.status === "error" ? state.error : state.output;
-    const outputText = output ? clipActivity(output) : "";
-    const paths = state.status === "error" || /\b(?:access denied|not found|outside allowed)\b/i.test(outputText)
-      ? []
-      : resolveLocalPaths(outputText, workspace);
     return {
       type: part.type,
       label: state.title || part.tool || "Tool",
       status: state.status || "pending",
-      detail: [input && `Input\n${input}`, outputText && `Output\n${outputText}`].filter(Boolean).join("\n\n"),
-      paths,
+      detail: [input && `Input\n${input}`, output && `Output\n${clipActivity(output)}`].filter(Boolean).join("\n\n"),
     };
   }
   if (part.type === "subtask") {
@@ -540,23 +497,10 @@ function activityRow(part, workspace) {
     };
   }
   if (part.type === "patch") {
-    return {
-      type: part.type,
-      label: `Changed ${part.files?.length || 0} file(s)`,
-      status: "completed",
-      detail: "",
-      paths: resolveLocalPaths((part.files || []).join("\n"), workspace),
-    };
+    return { type: part.type, label: `Changed ${part.files?.length || 0} file(s)`, status: "completed", detail: (part.files || []).join("\n") };
   }
   if (part.type === "file") {
-    const path = part.source?.path || part.path || "";
-    return {
-      type: part.type,
-      label: part.filename || path || "File",
-      status: "completed",
-      detail: part.mime || "",
-      paths: resolveLocalPaths(path, workspace),
-    };
+    return { type: part.type, label: part.filename || part.source?.path || "File", status: "completed", detail: part.mime || "" };
   }
   if (part.type === "retry") {
     return { type: part.type, label: `Retry ${part.attempt || 1}`, status: "error", detail: messageError(part.error) };
@@ -587,127 +531,6 @@ function messageError(error) {
   const name = error.name || "OpenCode error";
   const message = error.data?.message || error.message || "";
   return message ? `${name}: ${message}` : name;
-}
-
-function resolveLocalPaths(text, workspace) {
-  const value = String(text || "");
-  const candidates = [];
-  const seenLabels = new Set();
-  const addCandidate = (label) => {
-    const cleaned = cleanPathLabel(label);
-    if (!cleaned || seenLabels.has(cleaned.toLowerCase())) return;
-    seenLabels.add(cleaned.toLowerCase());
-    candidates.push(cleaned);
-  };
-
-  for (const match of value.matchAll(/`([^`\r\n]+)`|["']([^"'\r\n]+)["']/g)) {
-    addCandidate(match[1] || match[2]);
-  }
-  for (const line of value.split(/\r?\n/)) {
-    for (const match of line.matchAll(/[A-Za-z]:[\\/]|\\\\[^\\/\s]+[\\/]/g)) {
-      addCandidate(longestExistingPath(line.slice(match.index), workspace));
-    }
-  }
-  for (const match of value.matchAll(/(?:^|[\s([{"'`|])((?:\.{1,2}[\\/])?(?:[^\s<>"'`|:]+[\\/])+[^\s<>"'`|:]+|(?:\.{1,2}[\\/])?[^\s<>"'`|:]+\.[A-Za-z0-9_-]{1,16})(?=$|[\s)\]},;:'"`|])/gmu)) {
-    addCandidate(match[1]);
-  }
-
-  const output = [];
-  const seenPaths = new Set();
-  for (const label of candidates) {
-    const target = isAbsolute(label) ? normalize(label) : resolve(workspace, label);
-    let details;
-    try {
-      if (!existsSync(target)) continue;
-      details = statSync(target);
-    } catch {
-      continue;
-    }
-    const key = `${label.toLowerCase()}\0${target.toLowerCase()}`;
-    if (seenPaths.has(key)) continue;
-    seenPaths.add(key);
-    output.push({
-      label,
-      path: target,
-      type: details.isDirectory() ? "directory" : "file",
-    });
-    if (output.length >= 40) break;
-  }
-  return output;
-}
-
-function longestExistingPath(raw, workspace) {
-  let candidate = cleanPathLabel(
-    String(raw || "")
-      .split(/[<>"`|]/, 1)[0]
-      .split(/\s+(?:not in|is not|does not|was not|outside|from|to)\s+/i, 1)[0]
-  );
-  for (let attempt = 0; candidate && attempt < 20; attempt += 1) {
-    const target = isAbsolute(candidate) ? normalize(candidate) : resolve(workspace, candidate);
-    if (existsSync(target)) return candidate;
-    const cut = Math.max(candidate.lastIndexOf(" "), candidate.lastIndexOf("\t"));
-    if (cut < 0) break;
-    candidate = cleanPathLabel(candidate.slice(0, cut));
-  }
-  return "";
-}
-
-function cleanPathLabel(value) {
-  return String(value || "")
-    .trim()
-    .replace(/^["'`\u201c\u201d\u2018\u2019]+|["'`\u201c\u201d\u2018\u2019]+$/g, "")
-    .replace(/^[([{<\u3008\u300a]+|[)\]}>.,;:!?\u3002\uff0c\uff1b\uff1a\uff01\uff1f]+$/g, "");
-}
-
-function normalizeLocalPath(value) {
-  const text = String(value || "")
-    .trim()
-    .replace(/^["'`\u201c\u201d\u2018\u2019]+|["'`\u201c\u201d\u2018\u2019]+$/g, "");
-  return text ? normalize(text) : "";
-}
-
-async function localPathInfo(target) {
-  try {
-    const details = await stat(target);
-    return { exists: true, type: details.isDirectory() ? "directory" : "file" };
-  } catch {
-    return { exists: false, type: "missing" };
-  }
-}
-
-async function openLocalPath(target, type) {
-  if (process.platform === "win32") {
-    if (type === "directory") {
-      await spawnDetached("explorer.exe", [target]);
-    } else {
-      await spawnDetached("rundll32.exe", ["url.dll,FileProtocolHandler", target]);
-    }
-    return;
-  }
-  await spawnDetached(process.platform === "darwin" ? "open" : "xdg-open", [target]);
-}
-
-async function revealLocalFile(target) {
-  if (process.platform === "win32") {
-    await spawnDetached("explorer.exe", [`/select,${target}`]);
-    return;
-  }
-  if (process.platform === "darwin") {
-    await spawnDetached("open", ["-R", target]);
-    return;
-  }
-  await spawnDetached("xdg-open", [dirname(target)]);
-}
-
-function spawnDetached(command, args) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: false });
-    child.once("error", reject);
-    child.once("spawn", () => {
-      child.unref();
-      resolve();
-    });
-  });
 }
 
 async function sessionPreview(api, sessionID) {
@@ -805,16 +628,8 @@ async function promptSession(api, { sessionID, text, model, files = [] }) {
       ...files,
     ],
   };
-  const session = await getRawSession(api, sessionID);
-  const listedSession = (!session?.model || !session?.agent)
-    ? await getSession(api, sessionID)
-    : undefined;
-  const selectedModel =
-    await resolvePromptModel(api, model || session?.model || listedSession?.model) ||
-    await defaultPromptModel(api);
+  const selectedModel = model || await promptModel(api, sessionID);
   if (selectedModel) payload.model = selectedModel;
-  const agent = session?.agent || listedSession?.agent;
-  if (agent) payload.agent = agent;
   const method = api.client.session.promptAsync || api.client.session.prompt;
   await assertOk(method.call(api.client.session, payload));
   return { method: "session", model: selectedModel };
@@ -838,19 +653,10 @@ function normalizePromptFiles(files) {
 async function listModels(api) {
   const providers = [];
   let defaults = {};
-  if (api.opencodeUrl) {
-    try {
-      const result = await fetchOpenCode(api, "/config/providers");
-      if (Array.isArray(result?.providers)) providers.push(...result.providers);
-      if (result?.default && typeof result.default === "object") defaults = result.default;
-    } catch {}
-  }
   try {
-    if (!providers.length) {
-      const result = await assertOk(api.client.config.providers({}));
-      if (Array.isArray(result?.providers)) providers.push(...result.providers);
-      if (result?.default && typeof result.default === "object") defaults = result.default;
-    }
+    const result = await assertOk(api.client.config.providers({}));
+    if (Array.isArray(result?.providers)) providers.push(...result.providers);
+    if (result?.default && typeof result.default === "object") defaults = result.default;
   } catch {
     try {
       const result = await assertOk(api.client.provider.list({}));
@@ -923,60 +729,24 @@ function permissionSummary(permission, patterns, metadata) {
   return details.length ? details.join(" | ") : String(permission || "Permission requested");
 }
 
-async function resolvePromptModel(api, model) {
-  const normalized = normalizeModelObject(model);
-  if (!normalized) return undefined;
-
-  const models = await listModels(api);
-  const exact = models.find((item) =>
-    item.providerID === normalized.providerID && item.modelID === normalized.modelID
-  );
-  if (exact) return { providerID: exact.providerID, modelID: exact.modelID };
-
-  const shorthand = [
-    normalized.modelID,
-    normalized.providerID,
-    normalizeModel(model),
-  ].filter(Boolean);
-  const match = models.find((item) =>
-    shorthand.includes(item.modelID) ||
-    shorthand.includes(`${item.providerID}/${item.modelID}`)
-  );
-  return match
-    ? { providerID: match.providerID, modelID: match.modelID }
-    : normalized;
-}
-
-async function defaultPromptModel(api) {
-  const models = await listModels(api);
-  const selected =
-    models.find((item) => item.default && item.providerID === "opencode") ||
-    models.find((item) => item.default) ||
-    models[0];
-  return selected
-    ? { providerID: selected.providerID, modelID: selected.modelID }
-    : undefined;
+async function promptModel(api, sessionID) {
+  const session = await getRawSession(api, sessionID);
+  const normalized = normalizeModelObject(session?.model);
+  if (normalized) return normalized;
+  const fallback = normalizeModelObject(session?.next?.model || session?.nextModel || session?.modelID || session?.modelId);
+  if (fallback) return fallback;
+  const listed = await getSession(api, sessionID);
+  const listedModel = normalizeModelObject(listed?.model);
+  if (listedModel) return listedModel;
+  return undefined;
 }
 
 async function getRawSession(api, sessionID) {
-  if (api.opencodeUrl) {
-    try {
-      return await fetchOpenCode(api, `/session/${encodeURIComponent(sessionID)}`);
-    } catch {}
-  }
   try {
     return await assertOk(api.client.session.get({ sessionID }));
   } catch {
     return undefined;
   }
-}
-
-async function fetchOpenCode(api, pathname) {
-  const response = await fetch(new URL(pathname, api.opencodeUrl), {
-    signal: AbortSignal.timeout(10000),
-  });
-  if (!response.ok) throw new Error(`OpenCode API returned ${response.status}`);
-  return response.json();
 }
 
 function normalizeModelObject(model) {
@@ -1101,9 +871,15 @@ function markBrowserSeen() {
 function startIdleMonitor() {
   if (serverIdleTimer) clearInterval(serverIdleTimer);
   serverIdleTimer = setInterval(() => {
-    if (!server?.listening) closeServer();
+    if (!server?.listening || !lastBrowserSeen) return closeServerAndExitBrowserMode();
+    if (Date.now() - lastBrowserSeen > serverIdleMs) closeServerAndExitBrowserMode();
   }, 15000);
   serverIdleTimer.unref?.();
+}
+
+function closeServerAndExitBrowserMode() {
+  closeServer();
+  if (browserMode) process.exit(0);
 }
 
 function closeServer() {
@@ -1221,21 +997,24 @@ function openUrl(url) {
   spawn("xdg-open", [url], { detached: true, stdio: "ignore" }).unref();
 }
 
-async function openOpenCodeTerminal({ directory, sessionID, serverUrl, preferredCommand }) {
+async function openOpenCodeTerminal({ directory, sessionID, serverUrl }) {
   const args = serverUrl
     ? ["attach", serverUrl, "--dir", directory, ...(sessionID ? ["--session", sessionID] : [])]
     : (sessionID ? ["--session", sessionID] : []);
   if (process.platform === "win32") {
-    const command = await resolveOpenCodeTerminalCommand(preferredCommand);
+    const appData = process.env.APPDATA || join(homedir(), "AppData", "Roaming");
+    const executable = join(appData, "npm", "node_modules", "opencode-ai", "bin", "opencode.exe");
+    const cliCommand = join(appData, "npm", "opencode-cli.cmd");
+    const command = existsSync(executable) ? executable : cliCommand;
     const cwd = existsSync(directory) ? directory : homedir();
     const env = { ...process.env, OPENCODE_HISTORY_CLI: "1" };
-    const terminalCommand = /\.cmd$/i.test(command)
-      ? ["cmd.exe", "/d", "/k", command, ...args]
-      : [command, ...args];
-    if (await commandExists("wt.exe")) {
-      await spawnVisible("wt.exe", ["-w", "new", "-d", cwd, ...terminalCommand], { cwd, env });
-    } else {
-      await spawnVisible(terminalCommand[0], terminalCommand.slice(1), { cwd, env });
+    try {
+      await spawnVisible("wt.exe", ["-w", "new", "-d", cwd, command, ...args], { cwd, env });
+      return;
+    } catch {
+      const argumentList = args.length ? ` -ArgumentList @(${args.map(quotePowerShell).join(", ")})` : "";
+      const script = `Start-Process -FilePath ${quotePowerShell(command)}${argumentList} -WorkingDirectory ${quotePowerShell(cwd)}`;
+      await spawnVisible("powershell.exe", ["-NoProfile", "-Command", script], { cwd, env });
     }
     return;
   }
@@ -1249,33 +1028,8 @@ async function openOpenCodeTerminal({ directory, sessionID, serverUrl, preferred
   });
 }
 
-async function resolveOpenCodeTerminalCommand(preferredCommand) {
-  const appData = process.env.APPDATA || join(homedir(), "AppData", "Roaming");
-  const candidates = [
-    preferredCommand,
-    process.env.OPENCODE_BINARY,
-    /opencode/i.test(process.execPath) ? process.execPath : undefined,
-    join(appData, "npm", "node_modules", "opencode-ai", "bin", "opencode.exe"),
-    join(appData, "npm", "opencode.cmd"),
-    "opencode.exe",
-    "opencode.cmd",
-    "opencode",
-  ].filter(Boolean);
-  for (const candidate of [...new Set(candidates)]) {
-    if (isAbsolute(candidate) && existsSync(candidate)) return candidate;
-    if (!isAbsolute(candidate) && await commandExists(candidate)) return candidate;
-  }
-  throw new Error("OpenCode CLI executable was not found on this computer.");
-}
-
-async function commandExists(command) {
-  try {
-    const checker = process.platform === "win32" ? "where.exe" : "which";
-    await execFileAsync(checker, [command], { timeout: 5000, windowsHide: true });
-    return true;
-  } catch {
-    return false;
-  }
+function quotePowerShell(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
 }
 
 function spawnVisible(command, args, options) {

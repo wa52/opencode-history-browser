@@ -130,7 +130,6 @@ function renderCurrent() {
   $("detailTokens").textContent = `${current.tokensInput || 0} in / ${current.tokensOutput || 0} out`;
 
   for (const message of current.messages) {
-    if (message.aborted && !message.text) continue;
     if (!message.text && !message.extras.length && !message.activities?.length) continue;
     const node = document.createElement("article");
     const text = cleanMessageText(message.text || "");
@@ -139,12 +138,11 @@ function renderCurrent() {
     node.innerHTML = `
       <div class="role">${message.role === "user" ? "You" : "OpenCode"}</div>
       <div class="bubble">
-        <div class="content">${text ? renderPathText(text, message.paths || []) : ""}</div>
+        <div class="content">${text ? escapeHtml(text) : ""}</div>
         ${renderActivities(message.activities || [])}
         ${message.error ? `<div class="status-bar error-text">${escapeHtml(message.error)}</div>` : ""}
       </div>
     `;
-    bindPathActions(node);
     $("messages").appendChild(node);
   }
   $("messages").scrollTop = $("messages").scrollHeight;
@@ -153,10 +151,9 @@ function renderCurrent() {
 function renderActivities(activities) {
   if (!activities.length) return "";
   return `<div class="activity-list">${activities.map((activity) => {
-    const detail = activity.detail ? `<pre>${renderPathText(activity.detail, activity.paths || [])}</pre>` : "";
-    const expanded = activity.status === "running";
+    const detail = activity.detail ? `<pre>${escapeHtml(activity.detail)}</pre>` : "";
     return `
-      <details class="activity-item ${escapeHtml(activity.status || "")}" ${expanded ? "open" : ""}>
+      <details class="activity-item ${escapeHtml(activity.status || "")}" ${activity.status === "running" ? "open" : ""}>
         <summary>
           <span class="activity-dot"></span>
           <span>${escapeHtml(activity.label || activity.type)}</span>
@@ -563,14 +560,13 @@ function changeTheme() {
 
 async function sendPrompt(event) {
   event.preventDefault();
+  if (promptWatcher) {
+    await abortPrompt(activePromptSessionID);
+    return;
+  }
   if (sending) return;
   const text = $("promptInput").value.trim();
   const files = attachments.map(({ filename, mime, url }) => ({ filename, mime, url }));
-  if (promptWatcher) {
-    if (!text && !files.length) await abortPrompt(activePromptSessionID);
-    else setComposerStatus("OpenCode is still responding. Wait for it to finish or press Stop with an empty input.");
-    return;
-  }
   if (!text && !files.length) return;
   if (text.startsWith("/") && !files.length) {
     await runBrowserCommand(text);
@@ -904,52 +900,6 @@ function cleanMessageText(value) {
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
-}
-
-function renderPathText(text, paths) {
-  const matches = [];
-  const value = String(text || "");
-  const lower = value.toLowerCase();
-  for (const item of paths || []) {
-    const label = String(item?.label || "");
-    if (!label) continue;
-    const needle = label.toLowerCase();
-    let index = lower.indexOf(needle);
-    while (index >= 0) {
-      matches.push({ index, end: index + label.length, item });
-      index = lower.indexOf(needle, index + needle.length);
-    }
-  }
-  matches.sort((a, b) => a.index - b.index || b.end - a.end);
-
-  let cursor = 0;
-  let output = "";
-  for (const match of matches) {
-    if (match.index < cursor) continue;
-    output += escapeHtml(value.slice(cursor, match.index));
-    output += `<button class="openable-path ${escapeHtml(match.item.type)}" type="button" data-open-path="${escapeHtml(match.item.path)}" title="${match.item.type === "directory" ? "Open folder" : "Open file"}">${escapeHtml(value.slice(match.index, match.end))}</button>`;
-    cursor = match.end;
-  }
-  return output + escapeHtml(value.slice(cursor));
-}
-
-function bindPathActions(root) {
-  for (const button of root.querySelectorAll("[data-open-path]")) {
-    button.addEventListener("click", async () => {
-      const path = button.dataset.openPath;
-      try {
-        button.disabled = true;
-        await request("/api/local-path", {
-          method: "POST",
-          body: JSON.stringify({ path, action: "open" }),
-        });
-      } catch (error) {
-        setComposerStatus(error.message);
-      } finally {
-        button.disabled = false;
-      }
-    });
-  }
 }
 
 function readStoredJson(key, fallback) {

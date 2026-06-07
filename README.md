@@ -56,10 +56,6 @@ To verify an install:
 - See reasoning stages, tool calls, tool results, and task progress
 - Paste or attach images
 - Search and select models
-- Inline clickable paths in messages, Markdown, command output, and tool output
-- Resolve relative paths from the current session workspace
-- Support local drives, mapped drives, junctions, symlinks, and accessible UNC shares
-- Open files with the system default app and folders in Explorer
 - Browser commands: `/skills` and `/mcp`
 - Install self-check with `/history-browser-doctor`
 
